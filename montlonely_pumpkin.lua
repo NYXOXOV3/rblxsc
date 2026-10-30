@@ -184,7 +184,7 @@ local function safeQueueOnTeleport(code)
 end
 
 local function queueScriptAfterTeleport()
-    if SCRIPT_URL == "" then
+    if SCRIPT_URL == "https://raw.githubusercontent.com/NYXOXOV3/rblxsc/refs/heads/main/montlonely_pumpkin.lua" then
         return false, "SCRIPT_URL kosong — auto execute dilewati"
     end
     local payload = string.format([[pcall(function() loadstring(game:HttpGet("%s"))() end)]], SCRIPT_URL)
