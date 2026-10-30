@@ -20,9 +20,11 @@ local TELEPORT_OFFSET  = Vector3.new(0, 4, 0)
 local CHECK_INTERVAL   = 0.4
 local MIN_MOVE_DIST    = 5
 
--- URL script untuk auto-execute setelah server hop.
--- Upload script ini ke Pastebin (raw) / GitHub Gist (raw), lalu paste URL-nya di sini.
-local SCRIPT_URL = ""  -- contoh: "https://pastebin.com/raw/xxxxxxx"
+-- Server hop
+local SCRIPT_URL = ""                          -- isi URL Pastebin/Gist raw
+local VISIT_TTL  = 300                         -- 5 menit dalam detik
+local VISIT_FILE = "teleport_visited.json"
+local MAX_VISIT_ENTRIES = 500
 
 -- State auto rotate
 local autoRotate       = false
@@ -34,6 +36,9 @@ local autoTPConn     = nil
 local lastTargetRef  = nil
 local lastTargetPos  = nil
 local lastCheckTime  = 0
+
+-- Blacklist server
+local visitedServers = {}
 
 -- ============ HELPER ============
 local function track(conn)
@@ -127,24 +132,128 @@ local function getFirstPumpkin()
     return nil, nil
 end
 
--- ============ SERVER HOP HELPER ============
+-- ============ BLACKLIST HELPERS ============
+local function hasFileAPI()
+    return type(writefile) == "function"
+       and type(readfile) == "function"
+       and type(isfile) == "function"
+end
+
+local function pruneVisited()
+    local now = tick()
+    local count = 0
+    for jobId, ts in pairs(visitedServers) do
+        if now - ts >= VISIT_TTL then
+            visitedServers[jobId] = nil
+        else
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function loadVisitedFromFile()
+    if not hasFileAPI() then return end
+    if not isfile(VISIT_FILE) then return end
+    local ok, content = pcall(readfile, VISIT_FILE)
+    if not ok or not content or content == "" then return end
+    local decodeOk, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if not decodeOk or type(data) ~= "table" then return end
+    local now = tick()
+    for jobId, ts in pairs(data) do
+        if type(jobId) == "string" and type(ts) == "number" and now - ts < VISIT_TTL then
+            visitedServers[jobId] = ts
+        end
+    end
+end
+
+local function loadVisitedFromPreload()
+    -- Fallback: kalau file API tidak ada, terima data via _G dari queue_on_teleport
+    if hasFileAPI() then
+        _G.__preloadedVisited = nil
+        return
+    end
+    local data = _G.__preloadedVisited
+    _G.__preloadedVisited = nil
+    if type(data) ~= "table" then return end
+    local now = tick()
+    for jobId, ts in pairs(data) do
+        if type(jobId) == "string" and type(ts) == "number" and now - ts < VISIT_TTL then
+            visitedServers[jobId] = ts
+        end
+    end
+end
+
+local function saveVisited()
+    pruneVisited()
+    -- cap ukuran
+    local count = 0
+    for _ in pairs(visitedServers) do count = count + 1 end
+    if count > MAX_VISIT_ENTRIES then
+        -- hapus yang paling lama
+        local sorted = {}
+        for jobId, ts in pairs(visitedServers) do
+            table.insert(sorted, { id = jobId, ts = ts })
+        end
+        table.sort(sorted, function(a, b) return a.ts < b.ts end)
+        local toRemove = count - MAX_VISIT_ENTRIES
+        for i = 1, toRemove do
+            visitedServers[sorted[i].id] = nil
+        end
+    end
+
+    if not hasFileAPI() then return end
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(visitedServers) end)
+    if not ok then return end
+    pcall(writefile, VISIT_FILE, encoded)
+end
+
+local function markVisited(jobId)
+    if not jobId or jobId == "" then return end
+    visitedServers[jobId] = tick()
+    saveVisited()
+end
+
+local function isVisited(jobId)
+    local ts = visitedServers[jobId]
+    if not ts then return false end
+    if tick() - ts >= VISIT_TTL then
+        visitedServers[jobId] = nil
+        return false
+    end
+    return true
+end
+
+local function getBlacklistCount()
+    return pruneVisited()
+end
+
+local function clearVisited()
+    visitedServers = {}
+    if hasFileAPI() and isfile(VISIT_FILE) then
+        pcall(delfile, VISIT_FILE)
+    end
+end
+
+-- Load on startup
+loadVisitedFromFile()
+loadVisitedFromPreload()
+pruneVisited()
+
+-- ============ SERVER HOP ============
 local function fetchLowestServer()
-    local placeId = game.PlaceId
+    local currentJobId = game.JobId
     local url = string.format(
         "https://games.roblox.com/v1/games/%d/servers/0?sortOrder=1&excludeFullGames=true&limit=100",
-        placeId
+        game.PlaceId
     )
 
-    local ok, response = pcall(function()
-        return game:HttpGet(url)
-    end)
+    local ok, response = pcall(function() return game:HttpGet(url) end)
     if not ok then
         return nil, "❌ Gagal fetch daftar server (HTTP error)"
     end
 
-    local decodeOk, data = pcall(function()
-        return HttpService:JSONDecode(response)
-    end)
+    local decodeOk, data = pcall(function() return HttpService:JSONDecode(response) end)
     if not decodeOk or not data or not data.data then
         return nil, "❌ Response server list tidak valid"
     end
@@ -154,42 +263,103 @@ local function fetchLowestServer()
         return nil, "❌ Tidak ada server tersedia saat ini"
     end
 
+    -- Filter: skip current + yang masih ter-blacklist
+    local filtered = {}
+    local skippedCurrent = 0
+    local skippedBlacklist = 0
+    for _, s in ipairs(servers) do
+        if s.id == currentJobId then
+            skippedCurrent = skippedCurrent + 1
+        elseif isVisited(s.id) then
+            skippedBlacklist = skippedBlacklist + 1
+        else
+            table.insert(filtered, s)
+        end
+    end
+
+    local info = {
+        total = #servers,
+        skippedCurrent = skippedCurrent,
+        skippedBlacklist = skippedBlacklist,
+        fallback = false,
+    }
+
+    if #filtered == 0 then
+        -- Semua server ter-blacklist / cuma current server
+        -- Fallback: pilih server (bukan current) dengan waktu visit paling lama (paling dekat expired)
+        local fallbackList = {}
+        for _, s in ipairs(servers) do
+            if s.id ~= currentJobId then
+                table.insert(fallbackList, s)
+            end
+        end
+        if #fallbackList == 0 then
+            return nil, "❌ Hanya ada 1 server tersedia (server ini). Tidak bisa hop.", info
+        end
+        table.sort(fallbackList, function(a, b)
+            local ta = visitedServers[a.id] or 0
+            local tb = visitedServers[b.id] or 0
+            return ta < tb
+        end)
+        info.fallback = true
+        info.filtered = #fallbackList
+        return fallbackList[1], nil, info
+    end
+
     -- Urutkan dari pemain paling sedikit
-    table.sort(servers, function(a, b)
+    table.sort(filtered, function(a, b)
         return (a.playing or 0) < (b.playing or 0)
     end)
 
-    return servers[1], nil
+    info.filtered = #filtered
+    return filtered[1], nil, info
 end
 
--- Wrapper queue_on_teleport lintas executor[reference:1]
+-- Wrapper queue_on_teleport multi-executor
 local function safeQueueOnTeleport(code)
     if type(syn) == "table" and syn.queue_on_teleport then
-        local ok = pcall(function() syn.queue_on_teleport(code) end)
-        if ok then return true end
+        if pcall(function() syn.queue_on_teleport(code) end) then return true end
     end
     if type(queue_on_teleport) == "function" then
-        local ok = pcall(function() queue_on_teleport(code) end)
-        if ok then return true end
+        if pcall(function() queue_on_teleport(code) end) then return true end
     end
     if type(fluxus) == "table" and fluxus.queue_on_teleport then
-        local ok = pcall(function() fluxus.queue_on_teleport(code) end)
-        if ok then return true end
+        if pcall(function() fluxus.queue_on_teleport(code) end) then return true end
     end
     if type(krnl) == "table" and krnl.queue_on_teleport then
-        local ok = pcall(function() krnl.queue_on_teleport(code) end)
-        if ok then return true end
+        if pcall(function() krnl.queue_on_teleport(code) end) then return true end
     end
     return false
 end
 
+local function buildQueuePayload()
+    local base = string.format([[pcall(function() loadstring(game:HttpGet("%s"))() end)]], SCRIPT_URL)
+
+    -- Kalau tidak ada file API, inject visited via _G prelude
+    if not hasFileAPI() then
+        local now = tick()
+        local valid = {}
+        for jobId, ts in pairs(visitedServers) do
+            if now - ts < VISIT_TTL then
+                valid[jobId] = ts
+            end
+        end
+        local encoded = HttpService:JSONEncode(valid)
+        local prelude = string.format(
+            [[_G.__preloadedVisited = game:GetService("HttpService"):JSONDecode(%q)]],
+            encoded
+        )
+        return prelude .. "\n" .. base
+    end
+    return base
+end
+
 local function queueScriptAfterTeleport()
-    if SCRIPT_URL == "https://raw.githubusercontent.com/NYXOXOV3/rblxsc/refs/heads/main/montlonely_pumpkin.lua" then
+    if SCRIPT_URL == "" then
         return false, "SCRIPT_URL kosong — auto execute dilewati"
     end
-    local payload = string.format([[pcall(function() loadstring(game:HttpGet("%s"))() end)]], SCRIPT_URL)
-    local ok = safeQueueOnTeleport(payload)
-    if ok then
+    local payload = buildQueuePayload()
+    if safeQueueOnTeleport(payload) then
         return true
     end
     return false, "Executor tidak support queue_on_teleport"
@@ -207,7 +377,7 @@ screenGui.IgnoreGuiInset = false
 screenGui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, FRAME_W, 0, 370)  -- lebih tinggi karena ada tombol hop
+frame.Size = UDim2.new(0, FRAME_W, 0, 380)
 frame.Position = UDim2.new(0, 10, 0, 100)
 frame.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
 frame.BorderSizePixel = 0
@@ -230,7 +400,6 @@ title.TextSize = 16
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = frame
 
--- MINIMIZE
 local minBtn = Instance.new("TextButton")
 minBtn.Size = UDim2.new(0, 30, 0, 30)
 minBtn.Position = UDim2.new(1, -72, 0, 6)
@@ -246,7 +415,6 @@ local minCorner = Instance.new("UICorner")
 minCorner.CornerRadius = UDim.new(0, 6)
 minCorner.Parent = minBtn
 
--- CLOSE
 local closeBtn = Instance.new("TextButton")
 closeBtn.Size = UDim2.new(0, 30, 0, 30)
 closeBtn.Position = UDim2.new(1, -38, 0, 6)
@@ -262,7 +430,6 @@ local closeCorner = Instance.new("UICorner")
 closeCorner.CornerRadius = UDim.new(0, 6)
 closeCorner.Parent = closeBtn
 
--- TextBox
 local textBox = Instance.new("TextBox")
 textBox.Size = UDim2.new(1, -20, 0, 70)
 textBox.Position = UDim2.new(0, 10, 0, 40)
@@ -369,11 +536,11 @@ local rotateCorner = Instance.new("UICorner")
 rotateCorner.CornerRadius = UDim.new(0, 6)
 rotateCorner.Parent = rotateBtn
 
--- Row 4: SERVER HOP (BARU)
+-- Row 4: SERVER HOP | RESET BLACKLIST
 local hopBtn = Instance.new("TextButton")
-hopBtn.Size = UDim2.new(1, -20, 0, 38)
+hopBtn.Size = UDim2.new(0.55, -15, 0, 38)
 hopBtn.Position = UDim2.new(0, 10, 0, 258)
-hopBtn.Text = "🌐 SERVER HOP (Pemain Tersedikit)"
+hopBtn.Text = "🌐 SERVER HOP"
 hopBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 220)
 hopBtn.TextColor3 = Color3.new(1, 1, 1)
 hopBtn.Font = Enum.Font.GothamBold
@@ -385,9 +552,24 @@ local hopCorner = Instance.new("UICorner")
 hopCorner.CornerRadius = UDim.new(0, 6)
 hopCorner.Parent = hopBtn
 
+local resetBtn = Instance.new("TextButton")
+resetBtn.Size = UDim2.new(0.45, -15, 0, 38)
+resetBtn.Position = UDim2.new(0.55, 5, 0, 258)
+resetBtn.Text = "🧹 RESET BL"
+resetBtn.BackgroundColor3 = Color3.fromRGB(120, 60, 60)
+resetBtn.TextColor3 = Color3.new(1, 1, 1)
+resetBtn.Font = Enum.Font.GothamBold
+resetBtn.TextSize = 13
+resetBtn.BorderSizePixel = 0
+resetBtn.Parent = frame
+
+local resetCorner = Instance.new("UICorner")
+resetCorner.CornerRadius = UDim.new(0, 6)
+resetCorner.Parent = resetBtn
+
 -- Status
 local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -20, 0, 55)
+status.Size = UDim2.new(1, -20, 0, 65)
 status.Position = UDim2.new(0, 10, 0, 302)
 status.BackgroundTransparency = 1
 status.Text = "Masukkan koordinat manual, atau klik AUTO TP / SERVER HOP."
@@ -398,6 +580,13 @@ status.TextWrapped = true
 status.TextXAlignment = Enum.TextXAlignment.Left
 status.TextYAlignment = Enum.TextYAlignment.Top
 status.Parent = frame
+
+-- Update status dengan info blacklist
+local function setStatus(msg, color)
+    local count = getBlacklistCount()
+    status.Text = string.format("[Blacklist: %d] %s", count, msg)
+    status.TextColor3 = color or Color3.fromRGB(180, 180, 180)
+end
 
 -- ============ MOBILE FAB ============
 local fab = Instance.new("TextButton")
@@ -425,14 +614,12 @@ fabStroke.Thickness = 2
 fabStroke.Transparency = 0.5
 fabStroke.Parent = fab
 
--- Minimize toggle
 track(minBtn.MouseButton1Click:Connect(function()
     if not running then return end
     frame.Visible = false
     fab.Visible = true
 end))
 
--- FAB tap vs drag
 local fabDragging = false
 local fabMoved    = false
 local fabStartInputPos
@@ -531,9 +718,9 @@ local function autoTeleportTick()
     lastTargetRef = target.obj
     lastTargetPos = target.pivot.Position
 
-    status.Text = string.format("🎃 Auto-TP → %s (%.1f, %.1f, %.1f)",
-        target.obj.Name, target.pivot.X, target.pivot.Y, target.pivot.Z)
-    status.TextColor3 = Color3.fromRGB(200, 140, 255)
+    setStatus(string.format("🎃 Auto-TP → %s (%.1f, %.1f, %.1f)",
+        target.obj.Name, target.pivot.X, target.pivot.Y, target.pivot.Z),
+        Color3.fromRGB(200, 140, 255))
 end
 
 local function startAutoTP()
@@ -557,37 +744,32 @@ track(closeBtn.MouseButton1Click:Connect(function()
     stopScript()
 end))
 
--- TELEPORT manual
 track(tpBtn.MouseButton1Click:Connect(function()
     if not running then return end
     local cf = parseCFrame(textBox.Text)
     if not cf then
-        status.Text = "❌ Format salah! Butuh 3 atau 12 angka dipisah koma."
-        status.TextColor3 = Color3.fromRGB(255, 110, 110)
+        setStatus("❌ Format salah! Butuh 3 atau 12 angka dipisah koma.", Color3.fromRGB(255, 110, 110))
         return
     end
     local root = getRoot()
     if not root then
-        status.Text = "❌ Character / HumanoidRootPart tidak ditemukan."
-        status.TextColor3 = Color3.fromRGB(255, 110, 110)
+        setStatus("❌ Character / HumanoidRootPart tidak ditemukan.", Color3.fromRGB(255, 110, 110))
         return
     end
     savedCFrame = root.CFrame
     root.AssemblyLinearVelocity = Vector3.zero
     root.CFrame = cf
-    status.Text = string.format("✅ Teleport manual! (%.1f, %.1f, %.1f)", cf.X, cf.Y, cf.Z)
-    status.TextColor3 = Color3.fromRGB(120, 255, 140)
+    setStatus(string.format("✅ Teleport manual! (%.1f, %.1f, %.1f)", cf.X, cf.Y, cf.Z),
+        Color3.fromRGB(120, 255, 140))
 end))
 
--- AUTO TP
 track(autoBtn.MouseButton1Click:Connect(function()
     if not running then return end
     autoTeleport = not autoTeleport
     if autoTeleport then
         autoBtn.Text = "🎃 AUTO TP: ON"
         autoBtn.BackgroundColor3 = Color3.fromRGB(0, 170, 90)
-        status.Text = "🎃 Auto TP aktif — mencari pumpkin..."
-        status.TextColor3 = Color3.fromRGB(200, 140, 255)
+        setStatus("🎃 Auto TP aktif — mencari pumpkin...", Color3.fromRGB(200, 140, 255))
         lastTargetRef = nil
         lastTargetPos = nil
         startAutoTP()
@@ -597,40 +779,32 @@ track(autoBtn.MouseButton1Click:Connect(function()
         lastTargetPos = nil
         autoBtn.Text = "🎃 AUTO TP: OFF"
         autoBtn.BackgroundColor3 = Color3.fromRGB(150, 60, 200)
-        status.Text = "🎃 Auto TP dimatikan."
-        status.TextColor3 = Color3.fromRGB(180, 180, 180)
+        setStatus("🎃 Auto TP dimatikan.", Color3.fromRGB(180, 180, 180))
     end
 end))
 
--- BACK
 track(backBtn.MouseButton1Click:Connect(function()
     if not running then return end
     if not savedCFrame then
-        status.Text = "⚠ Belum ada posisi tersimpan. Teleport dulu."
-        status.TextColor3 = Color3.fromRGB(255, 210, 90)
+        setStatus("⚠ Belum ada posisi tersimpan. Teleport dulu.", Color3.fromRGB(255, 210, 90))
         return
     end
     local root = getRoot()
     if not root then
-        status.Text = "❌ Character tidak ditemukan."
-        status.TextColor3 = Color3.fromRGB(255, 110, 110)
+        setStatus("❌ Character tidak ditemukan.", Color3.fromRGB(255, 110, 110))
         return
     end
     root.AssemblyLinearVelocity = Vector3.zero
     root.CFrame = savedCFrame
-    status.Text = "↩ Kembali ke posisi sebelumnya."
-    status.TextColor3 = Color3.fromRGB(120, 200, 255)
+    setStatus("↩ Kembali ke posisi sebelumnya.", Color3.fromRGB(120, 200, 255))
 end))
 
--- CLEAR
 track(clearBtn.MouseButton1Click:Connect(function()
     if not running then return end
     textBox.Text = ""
-    status.Text = "🗑 Input dikosongkan."
-    status.TextColor3 = Color3.fromRGB(180, 180, 180)
+    setStatus("🗑 Input dikosongkan.", Color3.fromRGB(180, 180, 180))
 end))
 
--- AUTO ROTATE
 track(rotateBtn.MouseButton1Click:Connect(function()
     if not running then return end
     autoRotate = not autoRotate
@@ -638,48 +812,39 @@ track(rotateBtn.MouseButton1Click:Connect(function()
         local pivot = getFirstPumpkin()
         if not pivot then
             autoRotate = false
-            status.Text = "❌ Pumpkin tidak ditemukan, tidak bisa auto rotate."
-            status.TextColor3 = Color3.fromRGB(255, 110, 110)
+            setStatus("❌ Pumpkin tidak ditemukan, tidak bisa auto rotate.", Color3.fromRGB(255, 110, 110))
             return
         end
         rotateBtn.Text = "🔄 AUTO ROTATE: ON"
         rotateBtn.BackgroundColor3 = Color3.fromRGB(0, 170, 90)
-        status.Text = "🔄 Auto rotate aktif."
-        status.TextColor3 = Color3.fromRGB(120, 255, 140)
+        setStatus("🔄 Auto rotate aktif.", Color3.fromRGB(120, 255, 140))
         startAutoRotate()
     else
         stopRotate()
         rotateBtn.Text = "🔄 AUTO ROTATE: OFF"
         rotateBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
-        status.Text = "🔄 Auto rotate dimatikan."
-        status.TextColor3 = Color3.fromRGB(180, 180, 180)
+        setStatus("🔄 Auto rotate dimatikan.", Color3.fromRGB(180, 180, 180))
     end
 end))
 
--- SERVER HOP (BARU)
+-- SERVER HOP (dengan blacklist 5 menit)
 track(hopBtn.MouseButton1Click:Connect(function()
     if not running then return end
 
-    status.Text = "🌐 Mencari server dengan pemain tersedikit..."
-    status.TextColor3 = Color3.fromRGB(0, 200, 255)
+    setStatus("🌐 Mencari server...", Color3.fromRGB(0, 200, 255))
 
-    -- 1. Queue script untuk auto-execute setelah teleport
-    local queueOk, queueErr = queueScriptAfterTeleport()
-    if queueOk then
-        status.Text = "🌐 Script di-queue untuk auto-execute setelah hop..."
-    elseif SCRIPT_URL ~= "" then
-        -- queue gagal tapi URL diisi
-        status.Text = "⚠ " .. (queueErr or "queue_on_teleport gagal") .. " — hop tetap lanjut."
-    else
-        -- SCRIPT_URL kosong
-        status.Text = "⚠ SCRIPT_URL kosong — hop tanpa auto-execute."
+    -- 1. Queue script untuk auto-execute
+    if SCRIPT_URL ~= "" then
+        local queueOk = queueScriptAfterTeleport()
+        if not queueOk then
+            setStatus("⚠ queue_on_teleport gagal — hop tetap lanjut.", Color3.fromRGB(255, 210, 90))
+        end
     end
 
-    -- 2. Fetch server dengan pemain tersedikit
-    local server, err = fetchLowestServer()
+    -- 2. Fetch server terbaik
+    local server, err, info = fetchLowestServer()
     if not server then
-        status.Text = err or "❌ Gagal mendapatkan server."
-        status.TextColor3 = Color3.fromRGB(255, 110, 110)
+        setStatus(err or "❌ Gagal mendapatkan server.", Color3.fromRGB(255, 110, 110))
         return
     end
 
@@ -687,20 +852,40 @@ track(hopBtn.MouseButton1Click:Connect(function()
     local playing = server.playing or 0
     local maxPlayers = server.maxPlayers or "?"
 
-    status.Text = string.format("🌐 Server ditemukan: %d/%s pemain — teleport...", playing, maxPlayers)
-    status.TextColor3 = Color3.fromRGB(0, 200, 255)
+    -- 3. Mark server tujuan sebagai visited SEBELUM teleport (untuk blacklist)
+    markVisited(jobId)
 
-    -- 3. Teleport ke server tersebut
-    -- TeleportToPlaceInstance masih berfungsi di banyak executor meski deprecated.
+    local infoMsg = ""
+    if info then
+        if info.fallback then
+            infoMsg = " (fallback: semua ter-blacklist)"
+        elseif info.skippedBlacklist > 0 then
+            infoMsg = string.format(" (skip %d BL)", info.skippedBlacklist)
+        end
+    end
+
+    setStatus(string.format("🌐 → %d/%s pemain%s — teleport...", playing, maxPlayers, infoMsg),
+        Color3.fromRGB(0, 200, 255))
+
+    -- 4. Teleport
     local teleportOk, teleportErr = pcall(function()
         TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, player)
     end)
 
     if not teleportOk then
-        status.Text = "❌ Teleport gagal: " .. tostring(teleportErr)
-        status.TextColor3 = Color3.fromRGB(255, 110, 110)
+        -- Rollback: gagal teleport, jangan blacklist
+        visitedServers[jobId] = nil
+        saveVisited()
+        setStatus("❌ Teleport gagal: " .. tostring(teleportErr), Color3.fromRGB(255, 110, 110))
     else
-        status.Text = string.format("✅ Teleport ke server %d/%s pemain...", playing, maxPlayers)
-        status.TextColor3 = Color3.fromRGB(120, 255, 140)
+        setStatus(string.format("✅ Hop ke %d/%s pemain — server di-blacklist 5 menit.",
+            playing, maxPlayers), Color3.fromRGB(120, 255, 140))
     end
+end))
+
+-- RESET BLACKLIST
+track(resetBtn.MouseButton1Click:Connect(function()
+    if not running then return end
+    clearVisited()
+    setStatus("🧹 Blacklist server di-reset (kosong).", Color3.fromRGB(180, 200, 255))
 end))
