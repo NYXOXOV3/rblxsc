@@ -21,14 +21,14 @@ local CHECK_INTERVAL   = 0.4
 local MIN_MOVE_DIST    = 5
 
 -- Server hop
-local SCRIPT_URL = ""                          -- isi URL Pastebin/Gist raw
+local SCRIPT_URL = ""
 local VISIT_TTL  = 300
 local VISIT_FILE = "teleport_visited.json"
 local MAX_VISIT_ENTRIES = 500
 
 -- AUTO HOP saat pumpkin habis
-local EMPTY_GRACE_SECONDS = 8                  -- detik tanpa pumpkin sebelum hop
-local HOP_COOLDOWN        = 10                 -- jeda minimum antar hop attempt
+local EMPTY_GRACE_SECONDS = 8
+local HOP_COOLDOWN        = 10
 local AUTOHOP_FILE        = "teleport_autohop.txt"
 
 -- State auto rotate
@@ -36,7 +36,7 @@ local autoRotate       = false
 local rotateConnection = nil
 
 -- State auto teleport
-local autoTeleport   = true
+local autoTeleport   = false
 local autoTPConn     = nil
 local lastTargetRef  = nil
 local lastTargetPos  = nil
@@ -246,7 +246,6 @@ local function clearVisited()
     end
 end
 
--- AUTO HOP persistence
 local function loadAutoHopState()
     if not hasFileAPI() then
         local v = _G.__preloadedAutoHop
@@ -490,7 +489,6 @@ local tbCorner = Instance.new("UICorner")
 tbCorner.CornerRadius = UDim.new(0, 6)
 tbCorner.Parent = textBox
 
--- Row 1
 local tpBtn = Instance.new("TextButton")
 tpBtn.Size = UDim2.new(0.5, -15, 0, 42)
 tpBtn.Position = UDim2.new(0, 10, 0, 118)
@@ -521,7 +519,6 @@ local autoCorner = Instance.new("UICorner")
 autoCorner.CornerRadius = UDim.new(0, 6)
 autoCorner.Parent = autoBtn
 
--- Row 2
 local backBtn = Instance.new("TextButton")
 backBtn.Size = UDim2.new(0.5, -15, 0, 42)
 backBtn.Position = UDim2.new(0, 10, 0, 166)
@@ -552,7 +549,6 @@ local clearCorner = Instance.new("UICorner")
 clearCorner.CornerRadius = UDim.new(0, 6)
 clearCorner.Parent = clearBtn
 
--- Row 3: AUTO ROTATE
 local rotateBtn = Instance.new("TextButton")
 rotateBtn.Size = UDim2.new(1, -20, 0, 38)
 rotateBtn.Position = UDim2.new(0, 10, 0, 214)
@@ -568,7 +564,6 @@ local rotateCorner = Instance.new("UICorner")
 rotateCorner.CornerRadius = UDim.new(0, 6)
 rotateCorner.Parent = rotateBtn
 
--- Row 4: LOW POP | HIGH POP
 local lowBtn = Instance.new("TextButton")
 lowBtn.Size = UDim2.new(0.5, -15, 0, 38)
 lowBtn.Position = UDim2.new(0, 10, 0, 258)
@@ -599,7 +594,6 @@ local highCorner = Instance.new("UICorner")
 highCorner.CornerRadius = UDim.new(0, 6)
 highCorner.Parent = highBtn
 
--- Row 5: AUTO HOP | RESET BL (BARU)
 local autoHopBtn = Instance.new("TextButton")
 autoHopBtn.Size = UDim2.new(0.5, -15, 0, 38)
 autoHopBtn.Position = UDim2.new(0, 10, 0, 302)
@@ -630,7 +624,6 @@ local resetCorner = Instance.new("UICorner")
 resetCorner.CornerRadius = UDim.new(0, 6)
 resetCorner.Parent = resetBtn
 
--- Status
 local status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -20, 0, 75)
 status.Position = UDim2.new(0, 10, 0, 345)
@@ -650,11 +643,8 @@ local function setStatus(msg, color)
     status.TextColor3 = color or Color3.fromRGB(180, 180, 180)
 end
 
--- ============ SHARED HOP HANDLER ============
 local function doServerHop(mode)
     if not running then return end
-
-    -- Reset timer & cooldown supaya auto-hop tidak langsung menyusul
     lastHopAttempt = tick()
     emptyTimer = 0
 
@@ -889,6 +879,12 @@ local function startAutoTP()
     end)
 end
 
+-- ============ INIT: AUTO TP DEFAULT ON (BARU) ============
+autoTeleport = true
+autoBtn.Text = "🎃 AUTO TP: ON"
+autoBtn.BackgroundColor3 = Color3.fromRGB(0, 170, 90)
+startAutoTP()
+
 -- ============ LOAD PERSISTED AUTO HOP ============
 if loadAutoHopState() then
     autoHopEmpty = true
@@ -1001,7 +997,6 @@ track(highBtn.MouseButton1Click:Connect(function()
     doServerHop("high")
 end))
 
--- AUTO HOP TOGGLE (BARU)
 track(autoHopBtn.MouseButton1Click:Connect(function()
     if not running then return end
     autoHopEmpty = not autoHopEmpty
